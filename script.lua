@@ -5,199 +5,6 @@
 -- No anti-detection, moderation-evasion, HWID spoofing, admin avoidance, or remote bypass logic is included.
 
 -- =========================================================
--- PHASE 0: SAFE ISOLATION BOUNDARY
--- =========================================================
---
--- This boundary intentionally does not hook Roblox metatables, intercept
--- ScriptContext/logging, hide UI instances, or mask scheduler threads.
---
--- Isolation is achieved through:
---   * lexical/local state only
---   * no writes to _G, shared, or getgenv()
---   * explicit capability scoping
---   * bounded private diagnostics
---   * protected initialization helpers
---   * deterministic cleanup registration
---
--- The module is defined before services, UI, controllers, or scheduler startup.
-
-local IsolationBoundary = (function()
-    local MAX_DIAGNOSTICS = 128
-
-    local privateState = {
-        Destroyed = false,
-        StartedAt = os.clock(),
-
-        Diagnostics = {},
-        CleanupStack = {},
-
-        CapabilityPolicy = {
-            AllowFilePersistence = true,
-            AllowClipboard = false,
-            AllowQueueOnTeleport = false,
-            AllowExternalEnvironmentWrites = false,
-            AllowMetatableHooks = false,
-            AllowLogInterception = false,
-            AllowThreadMasking = false,
-            AllowHiddenUIParenting = false,
-        },
-    }
-
-    local public = {}
-
-    local function pushDiagnostic(level, source, message)
-        if privateState.Destroyed then
-            return
-        end
-
-        local diagnostics = privateState.Diagnostics
-
-        diagnostics[#diagnostics + 1] = {
-            Timestamp = os.clock(),
-            Level = tostring(level or "INFO"),
-            Source = tostring(source or "Unknown"),
-            Message = tostring(message or ""),
-        }
-
-        if #diagnostics > MAX_DIAGNOSTICS then
-            table.remove(diagnostics, 1)
-        end
-    end
-
-    function public:IsDestroyed()
-        return privateState.Destroyed
-    end
-
-    function public:GetPolicy()
-        local policy = {}
-
-        for key, value in pairs(privateState.CapabilityPolicy) do
-            policy[key] = value
-        end
-
-        return policy
-    end
-
-    function public:IsCapabilityAllowed(name)
-        return privateState.CapabilityPolicy[name] == true
-    end
-
-    function public:RecordDiagnostic(level, source, message)
-        pushDiagnostic(level, source, message)
-    end
-
-    function public:GetDiagnostics()
-        local copy = {}
-
-        for index, entry in ipairs(privateState.Diagnostics) do
-            copy[index] = {
-                Timestamp = entry.Timestamp,
-                Level = entry.Level,
-                Source = entry.Source,
-                Message = entry.Message,
-            }
-        end
-
-        return copy
-    end
-
-    function public:ClearDiagnostics()
-        table.clear(privateState.Diagnostics)
-    end
-
-    function public:RunProtected(label, callback, ...)
-        assert(type(callback) == "function", "RunProtected requires callback")
-
-        if privateState.Destroyed then
-            return false, "isolation boundary destroyed"
-        end
-
-        local packed = table.pack(...)
-
-        local ok, resultA, resultB, resultC = pcall(function()
-            return callback(table.unpack(packed, 1, packed.n))
-        end)
-
-        if not ok then
-            pushDiagnostic("ERROR", label, resultA)
-            return false, resultA
-        end
-
-        return true, resultA, resultB, resultC
-    end
-
-    function public:RegisterCleanup(label, callback)
-        assert(type(callback) == "function", "RegisterCleanup requires callback")
-
-        if privateState.Destroyed then
-            return false
-        end
-
-        privateState.CleanupStack[#privateState.CleanupStack + 1] = {
-            Label = tostring(label or "Cleanup"),
-            Callback = callback,
-        }
-
-        return true
-    end
-
-    function public:ResolveVisibleUIParent()
-        -- Deliberately returns a normal, visible Roblox UI parent.
-        -- No gethui(), hidden folders, CoreGui cloaking, or child-list spoofing.
-        local ok, playerGui = pcall(function()
-            local players = game:GetService("Players")
-            local localPlayer = players.LocalPlayer
-
-            if not localPlayer then
-                return nil
-            end
-
-            return localPlayer:FindFirstChildOfClass("PlayerGui")
-        end)
-
-        if ok then
-            return playerGui
-        end
-
-        pushDiagnostic("WARN", "ResolveVisibleUIParent", playerGui)
-        return nil
-    end
-
-    function public:GetStatus()
-        return {
-            Destroyed = privateState.Destroyed,
-            StartedAt = privateState.StartedAt,
-            Uptime = math.max(os.clock() - privateState.StartedAt, 0),
-            DiagnosticCount = #privateState.Diagnostics,
-            CleanupCount = #privateState.CleanupStack,
-            Policy = self:GetPolicy(),
-        }
-    end
-
-    function public:Destroy()
-        if privateState.Destroyed then
-            return
-        end
-
-        for index = #privateState.CleanupStack, 1, -1 do
-            local entry = privateState.CleanupStack[index]
-
-            local ok, err = pcall(entry.Callback)
-            if not ok then
-                pushDiagnostic("ERROR", "Cleanup:" .. entry.Label, err)
-            end
-        end
-
-        table.clear(privateState.CleanupStack)
-        table.clear(privateState.Diagnostics)
-
-        privateState.Destroyed = true
-    end
-
-    return table.freeze(public)
-end)()
-
--- =========================================================
 -- PART 1: SERVICES AND BOOTSTRAP
 -- =========================================================
 
@@ -218,19 +25,6 @@ local Framework = {
     Destroyed = false,
 }
 
-Framework.Isolation = {
-    GetStatus = function()
-        return IsolationBoundary:GetStatus()
-    end,
-
-    GetDiagnostics = function()
-        return IsolationBoundary:GetDiagnostics()
-    end,
-
-    ClearDiagnostics = function()
-        IsolationBoundary:ClearDiagnostics()
-    end,
-}
 
 local function now()
     return os.clock()
@@ -292,32 +86,25 @@ end
 -- PART 2: CAPABILITY DETECTION
 -- =========================================================
 
-local IsolationPolicy = IsolationBoundary:GetPolicy()
-
 local Capabilities = {
-    -- Detection is informational only. The framework never writes shared state.
     SharedEnvironment = type(getgenv) == "function",
 
     Files = {
-        Read = IsolationPolicy.AllowFilePersistence and type(readfile) == "function",
-        Write = IsolationPolicy.AllowFilePersistence and type(writefile) == "function",
-        CheckFile = IsolationPolicy.AllowFilePersistence and type(isfile) == "function",
-        CheckFolder = IsolationPolicy.AllowFilePersistence and type(isfolder) == "function",
-        CreateFolder = IsolationPolicy.AllowFilePersistence and type(makefolder) == "function",
-        DeleteFile = IsolationPolicy.AllowFilePersistence and type(delfile) == "function",
-        ListFiles = IsolationPolicy.AllowFilePersistence and type(listfiles) == "function",
+        Read = type(readfile) == "function",
+        Write = type(writefile) == "function",
+        CheckFile = type(isfile) == "function",
+        CheckFolder = type(isfolder) == "function",
+        CreateFolder = type(makefolder) == "function",
+        DeleteFile = type(delfile) == "function",
+        ListFiles = type(listfiles) == "function",
     },
 
-    Clipboard = IsolationPolicy.AllowClipboard and type(setclipboard) == "function",
-    QueueOnTeleport = IsolationPolicy.AllowQueueOnTeleport
-        and type(queue_on_teleport) == "function",
+    Clipboard = type(setclipboard) == "function",
+    QueueOnTeleport = type(queue_on_teleport) == "function",
 }
 
 Framework.Capabilities = Capabilities
 
-IsolationBoundary:RegisterCleanup("FrameworkCapabilitySnapshot", function()
-    table.clear(Capabilities.Files)
-end)
 
 -- =========================================================
 -- PART 3: STATE STORE
@@ -4555,7 +4342,6 @@ function CleanupManager:FullUnload()
     Framework.Destroyed = true
     State:Set("Runtime.Status", "Destroyed")
 
-    IsolationBoundary:Destroy()
 end
 
 local Cleanup = CleanupManager.new()
@@ -4578,15 +4364,16 @@ function Framework:Start()
         return false, "framework already destroyed"
     end
 
-    local initOk, initResult = IsolationBoundary:RunProtected(
-        "Framework.Start.AdapterInitialize",
-        function()
-            return Adapter:Initialize()
-        end
-    )
+    local initOk, initResult = pcall(function()
+        return Adapter:Initialize()
+    end)
 
     if not initOk then
         return false, tostring(initResult)
+    end
+
+    if type(initResult) ~= "table" then
+        return false, "Adapter:Initialize returned an invalid result."
     end
 
     if not initResult.Ok then
@@ -4601,31 +4388,65 @@ function Framework:Start()
 end
 
 -- =========================================================
--- RAYFIELD BOOTSTRAP EXAMPLE
+-- PART 28: DIRECT BOOTSTRAP
 -- =========================================================
+--
+-- Production-safe bootstrap for an owned Roblox experience:
+-- place a Rayfield-compatible ModuleScript named "Rayfield" in ReplicatedStorage.
+-- The module must return the Rayfield library table.
 
--- The maintained Rayfield documentation uses the Sirius loader.
--- This block is intentionally not auto-executed so the host controls network loading.
---
--- local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
--- UI:Initialize(Rayfield)
---
--- IMPORTANT:
--- The stable documented API exposes CreateTab, but does not document a tab-selected callback.
--- Strict physical-click lazy loading therefore requires a supported selection source.
---
--- Example integration contract:
---
--- LazyTabs:AttachSelectionSource(function(onSelected)
---     -- subscribe to a supported tab-selection event here
---     -- onSelected("Main Farm")
---     -- return unsubscribe function
---     return function() end
--- end)
---
--- Until NotifySelected(tabName) is called by that integration source,
--- tab content is not instantiated.
+local function resolveRayfieldLibrary()
+    local module = ReplicatedStorage:FindFirstChild("Rayfield")
 
-Framework:Start()
+    if not module then
+        return nil, "ReplicatedStorage.Rayfield ModuleScript was not found."
+    end
+
+    if not module:IsA("ModuleScript") then
+        return nil, "ReplicatedStorage.Rayfield must be a ModuleScript."
+    end
+
+    local ok, library = pcall(require, module)
+
+    if not ok then
+        return nil, "Rayfield module failed to load: " .. tostring(library)
+    end
+
+    if type(library) ~= "table" then
+        return nil, "Rayfield module returned an invalid value."
+    end
+
+    return library, nil
+end
+
+local Rayfield, rayfieldError = resolveRayfieldLibrary()
+
+if not Rayfield then
+    error(rayfieldError)
+end
+
+local uiOk, uiResult = pcall(function()
+    return UI:Initialize(Rayfield)
+end)
+
+if not uiOk then
+    error("UI initialization failed: " .. tostring(uiResult))
+end
+
+if uiResult ~= true then
+    error("UI initialization returned a non-success result.")
+end
+
+local started, startError = Framework:Start()
+
+if not started then
+    error("Framework failed to start: " .. tostring(startError))
+end
+
+local lazyOk, lazyError = LazyTabs:NotifySelected("Main Farm")
+
+if lazyOk == false then
+    error("Main Farm tab failed to initialize: " .. tostring(lazyError))
+end
 
 return Framework
